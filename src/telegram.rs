@@ -153,6 +153,19 @@ pub static DOWNLOAD_PERMITS: once_cell::sync::Lazy<tokio::sync::Semaphore> =
         std::env::var("CONCURRENCY").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n >= 1 && n <= 32).unwrap_or(6),
     ));
 
+/// Hot-resize the download semaphore from the chat bot's /set concurrency command.
+/// Growing adds permits immediately; shrinking closes permits that will free up as
+/// in-flight downloads finish (acquired permits are never force-revoked). Returns
+/// the effective current limit.
+pub fn set_download_permits(n: usize) -> usize {
+    let n = n.clamp(1, 32);
+    let sem = &*DOWNLOAD_PERMITS;
+    let cur = sem.available_permits();
+    if n > cur { sem.add_permits(n - cur); }
+    else if n < cur { sem.forget_permits(cur - n); }
+    sem.available_permits().max(0).max(1) // never report below 1; clamp safety
+}
+
 /// Global pacing gate for getFile calls across all in-flight downloads.
 /// Community-measured safe rate is ~20/s; 15/s (one tick every ~67ms) leaves
 /// headroom. Callers serialize on the mutex and each is released one tick apart,

@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::{config::Config, db};
 use chrono::Utc;
 use rusqlite::Connection;
 use std::{path::{Path, PathBuf}, sync::Arc, time::Duration};
@@ -6,12 +6,34 @@ use tokio::fs;
 use tracing::{error, info, warn};
 
 pub async fn run_scheduler(cfg: Arc<Config>) {
-    if cfg.backup_interval_secs == 0 { info!("BACKUP_INTERVAL_SECS=0, automatic backups disabled"); return; }
-    let mut tick = tokio::time::interval(Duration::from_secs(cfg.backup_interval_secs));
+    // Read once for the initial tick; then re-read each loop so /set changes to
+    // backup_interval / backup_keep apply without a container restart. interval=0
+    // disables the schedule entirely (checked dynamically, so it can be re-enabled
+    // live too).
     loop {
-        tick.tick().await;
-        match backup_now(&cfg).await {
-            Ok(p) => info!(path=?p, "sqlite backup snapshot taken"),
+        let (interval, keep) = {
+            let p = cfg.database_path.clone();
+            let (iv, kp) = tokio::task::spawn_blocking(move || {
+                let iv = db::setting_get(&p, "backup_interval_secs").ok().flatten()
+                    .and_then(|v| v.parse::<u64>().ok());
+                let kp = db::setting_get(&p, "backup_keep").ok().flatten()
+                    .and_then(|v| v.parse::<usize>().ok());
+                (iv, kp)
+            }).await.unwrap_or((None, None));
+            (iv.unwrap_or(cfg.backup_interval_secs), kp.unwrap_or(cfg.backup_keep))
+        };
+        if interval == 0 {
+            tracing::info!("backup scheduler: interval=0, disabled; re-checking in 60s");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            continue;
+        }
+        tokio::time::sleep(Duration::from_secs(interval)).await;
+        // Re-apply `keep` for this round: prune() reads cfg, so mutate through a
+        // fresh Arc copy via a scoped clone.
+        let mut c2 = (*cfg).clone();
+        c2.backup_keep = keep;
+        match backup_now(&c2).await {
+            Ok(p) => info!(path=?p, keep, "sqlite backup snapshot taken"),
             Err(e) => error!(%e, "scheduled backup failed"),
         }
     }
@@ -20,8 +42,13 @@ pub async fn run_scheduler(cfg: Arc<Config>) {
 /// Online SQLite backup (does not block writers) + retention pruning. Filename is
 /// timestamp-sortable so pruning is just "keep the lexicographically-last N".
 pub async fn backup_now(cfg: &Config) -> Result<PathBuf, String> {
+    backup_now_tagged(cfg, false).await
+}
+/// `pre_restore=true` names the snapshot `*-pre-restore.sqlite` so it survives as a
+/// clear rollback point even after retention pruning (admins know to keep it).
+pub async fn backup_now_tagged(cfg: &Config, pre_restore: bool) -> Result<PathBuf, String> {
     fs::create_dir_all(&cfg.backup_dir).await.map_err(|e| e.to_string())?;
-    let name = format!("tg-s3-{}.sqlite", Utc::now().format("%Y%m%dT%H%M%SZ"));
+    let name = if pre_restore { format!("tg-s3-{}-pre-restore.sqlite", Utc::now().format("%Y%m%dT%H%M%SZ")) } else { format!("tg-s3-{}.sqlite", Utc::now().format("%Y%m%dT%H%M%SZ")) };
     let dest = cfg.backup_dir.join(&name);
     let src = cfg.database_path.clone();
     let dest2 = dest.clone();
@@ -82,7 +109,7 @@ pub async fn recover_from(cfg: &Config, uploaded: &Path) -> Result<(), String> {
     if ok.as_deref() != Some("ok") {
         return Err("PRAGMA integrity_check failed on the uploaded file; refusing to restore a possibly-corrupt database".into());
     }
-    backup_now(cfg).await.map_err(|e| format!("pre-restore safety backup failed, aborting restore: {e}"))?;
+    backup_now_tagged(cfg, true).await.map_err(|e| format!("pre-restore safety backup failed, aborting restore: {e}"))?;
     let wal = format!("{}-wal", cfg.database_path.display());
     let shm = format!("{}-shm", cfg.database_path.display());
     let _ = fs::remove_file(&wal).await;

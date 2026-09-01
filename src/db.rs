@@ -56,6 +56,7 @@ pub fn init(path: &Path) -> Result<(), DbError> {
             upload_id TEXT NOT NULL, idx INTEGER NOT NULL, part_number INTEGER NOT NULL,
             message_id INTEGER NOT NULL, file_id TEXT NOT NULL,
             size INTEGER NOT NULL, PRIMARY KEY(upload_id,idx));
+        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
     ")?;
     // --- migration: DBs created by v1.0 lack mp_chunks.part_number (v1.1 writes 6 cols) ---
     {
@@ -404,4 +405,43 @@ pub fn mp_list_uploads(path: &Path, bucket: &str) -> Result<Vec<MultipartUpload>
     let mut out = Vec::new();
     while let Some(r) = rows.next()? { out.push(row_to_mp(r)?); }
     Ok(out)
+}
+
+// ---------- runtime settings (chat-bot tunables; survive restarts) ----------
+
+/// Read one setting; `None` = not overridden (callers fall back to env default).
+pub fn setting_get(path: &Path, key: &str) -> Result<Option<String>, DbError> {
+    let c = Connection::open(path)?;
+    Ok(c.query_row("SELECT value FROM settings WHERE key=?", [key], |r| r.get::<_, String>(0)).ok())
+}
+/// Insert-or-update one setting. Validated by the caller before reaching here.
+pub fn setting_set(path: &Path, key: &str, value: &str) -> Result<(), DbError> {
+    let c = Connection::open(path)?;
+    c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [key, value])?;
+    Ok(())
+}
+/// All overridden settings as (key, value) pairs, for /status display.
+pub fn settings_list(path: &Path) -> Result<Vec<(String, String)>, DbError> {
+    let c = Connection::open(path)?;
+    let mut stmt = c.prepare("SELECT key,value FROM settings ORDER BY key")?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? { out.push((r.get::<_, String>(0)?, r.get::<_, String>(1)?)); }
+    Ok(out)
+}
+
+// ---------- quick stats for /status ----------
+
+pub struct Stats { pub objects: i64, pub bytes: i64, pub buckets: i64, pub keys: i64, pub mp_active: i64, pub chunks: i64 }
+pub fn stats(path: &Path) -> Result<Stats, DbError> {
+    let c = Connection::open(path)?;
+    let one = |sql: &str| -> Result<i64, DbError> { Ok(c.query_row(sql, [], |r| r.get(0))?) };
+    Ok(Stats {
+        objects: one("SELECT COUNT(*) FROM objects")?,
+        bytes: one("SELECT COALESCE(SUM(size),0) FROM objects")?,
+        buckets: one("SELECT COUNT(*) FROM buckets")?,
+        keys: one("SELECT COUNT(*) FROM credentials")?,
+        mp_active: one("SELECT COUNT(*) FROM multipart_uploads")?,
+        chunks: one("SELECT COUNT(*) FROM object_chunks")?,
+    })
 }
