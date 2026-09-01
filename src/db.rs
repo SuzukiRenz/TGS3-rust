@@ -17,6 +17,14 @@ pub fn open_conn(path: &Path) -> Result<Connection, DbError> {
     Ok(c)
 }
 
+/// Begin an IMMEDIATE transaction: acquires the write lock up front instead of
+/// upgrading from a read lock mid-transaction. With busy_timeout this makes
+/// concurrent writers QUEUE instead of failing instantly with SQLITE_BUSY
+/// (deferred read->write upgrades bypass busy_timeout on snapshot conflict).
+pub fn imm_tx(c: &mut Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+}
+
 #[derive(Clone, Debug)]
 pub struct ObjectMeta {
     pub bucket: String, pub key: String, pub size: i64, pub content_type: String, pub etag: String,
@@ -141,7 +149,7 @@ pub fn cred_rotate(path: &Path, access_key: &str, new_secret: &str) -> Result<bo
 /// The old access_key disappears immediately -- clients still holding it get 403.
 pub fn cred_rekey(path: &Path, old_access_key: &str, new_access_key: &str, new_secret: &str) -> Result<bool, DbError> {
     let mut c = open_conn(path)?;
-    let tx = c.transaction()?;
+    let tx = imm_tx(&mut c)?;
     let n = tx.execute(
         "UPDATE credentials SET access_key=?, secret_key=? WHERE access_key=?",
         params![new_access_key, new_secret, old_access_key],
@@ -184,7 +192,7 @@ pub fn ensure_bucket(path: &Path, bucket: &str) -> Result<(), DbError> {
 // ---------- objects (chunked) ----------
 pub fn put_object(path: &Path, o: &ObjectMeta, chunks: &[ChunkRef]) -> Result<(), DbError> {
     let mut c = open_conn(path)?;
-    let tx = c.transaction()?;
+    let tx = imm_tx(&mut c)?;
     tx.execute("INSERT OR IGNORE INTO buckets(name,created_at) VALUES(?,strftime('%s','now'))", [&o.bucket])?;
     tx.execute("DELETE FROM object_chunks WHERE bucket=? AND key=?", params![o.bucket, o.key])?;
     tx.execute("INSERT OR REPLACE INTO objects VALUES(?,?,?,?,?,?,?,?)",
@@ -225,7 +233,7 @@ fn escape_like(s: &str) -> String { s.replace('\\', "\\\\").replace('%', "\\%").
 /// can leave multiple keys pointing at the same underlying message).
 pub fn delete_object(path: &Path, bucket: &str, key: &str) -> Result<Option<Vec<ChunkRef>>, DbError> {
     let mut c = open_conn(path)?;
-    let tx = c.transaction()?;
+    let tx = imm_tx(&mut c)?;
     let chunks: Vec<ChunkRef> = {
         let mut stmt = tx.prepare("SELECT idx,message_id,file_id,size FROM object_chunks WHERE bucket=? AND key=?")?;
         let mut rows = stmt.query(params![bucket, key])?;
@@ -250,7 +258,7 @@ pub fn chunk_still_referenced(path: &Path, message_id: i64, excluding_bucket: &s
 /// object shares the same server-side master key.
 pub fn copy_object_fastpath(path: &Path, src_bucket: &str, src_key: &str, dst_bucket: &str, dst_key: &str, new_content_type: Option<&str>, now: i64) -> Result<Option<ObjectMeta>, DbError> {
     let mut c = open_conn(path)?;
-    let tx = c.transaction()?;
+    let tx = imm_tx(&mut c)?;
     let src: Option<ObjectMeta> = {
         let mut stmt = tx.prepare("SELECT bucket,key,size,content_type,etag,updated_at,sse_algorithm,sse_customer_key_md5 FROM objects WHERE bucket=? AND key=?")?;
         let mut rows = stmt.query(params![src_bucket, src_key])?;
@@ -289,7 +297,7 @@ pub fn mp_get(path: &Path, upload_id: &str) -> Result<Option<MultipartUpload>, D
 /// carries its own GCM nonce, but chunk indices must still not collide).
 pub fn mp_reserve(path: &Path, upload_id: &str, n_chunks: i64) -> Result<i64, DbError> {
     let mut c = open_conn(path)?;
-    let tx = c.transaction()?;
+    let tx = imm_tx(&mut c)?;
     let first: i64 = tx.query_row("SELECT next_chunk_idx FROM multipart_uploads WHERE upload_id=?", [upload_id], |r| r.get(0))?;
     tx.execute("UPDATE multipart_uploads SET next_chunk_idx=next_chunk_idx+? WHERE upload_id=?", params![n_chunks, upload_id])?;
     tx.commit()?;
@@ -307,7 +315,7 @@ pub fn mp_insert_chunk(path: &Path, upload_id: &str, idx: i64, part_number: i64,
 /// mp_insert_chunk-per-chunk + mp_advance two-step.
 pub fn mp_stage_part(path: &Path, upload_id: &str, part_number: i64, etag: &str, part_size: i64, rows: &[ChunkRef], staged_paths: &[String]) -> Result<(), DbError> {
     let mut c = open_conn(path)?;
-    let tx = c.transaction()?;
+    let tx = imm_tx(&mut c)?;
     for (r, p) in rows.iter().zip(staged_paths.iter()) {
         tx.execute("INSERT INTO mp_chunks(upload_id,idx,part_number,message_id,file_id,size) VALUES(?,?,?,?,?,?)",
             params![upload_id, r.idx, part_number, r.message_id, p, r.size])?;
@@ -325,7 +333,7 @@ pub fn mp_stage_part(path: &Path, upload_id: &str, part_number: i64, etag: &str,
 /// message_id is still 0 (staged on disk). `triples` is (idx, message_id, file_id).
 pub fn mp_fill_album_results(path: &Path, upload_id: &str, triples: &[(i64, i64, String)]) -> Result<(), DbError> {
     let mut c = open_conn(path)?;
-    let tx = c.transaction()?;
+    let tx = imm_tx(&mut c)?;
     for (idx, message_id, file_id) in triples {
         tx.execute("UPDATE mp_chunks SET message_id=?, file_id=? WHERE upload_id=? AND idx=? AND message_id=0",
             params![message_id, file_id, upload_id, idx])?;
@@ -349,7 +357,7 @@ pub fn mp_get_staged_chunks_pn(path: &Path, upload_id: &str) -> Result<Vec<(i64,
 }
 pub fn mp_advance(path: &Path, upload_id: &str, part_number: i64, etag: &str, part_size: i64, first_chunk_idx: i64, chunk_count: i64) -> Result<(), DbError> {
     let mut c = open_conn(path)?;
-    let tx = c.transaction()?;
+    let tx = imm_tx(&mut c)?;
     tx.execute("UPDATE multipart_uploads SET bytes_so_far=bytes_so_far+?, parts_uploaded=parts_uploaded+1 WHERE upload_id=?", params![part_size, upload_id])?;
     tx.execute("INSERT OR REPLACE INTO multipart_parts VALUES(?,?,?,?,?,?)", params![upload_id, part_number, etag, part_size, first_chunk_idx, chunk_count])?;
     tx.commit()?;
@@ -366,7 +374,7 @@ pub fn mp_list_parts(path: &Path, upload_id: &str) -> Result<Vec<MultipartPart>,
 /// Abort: return every staged Telegram chunk (caller deletes them from Telegram) and drop bookkeeping.
 pub fn mp_abort(path: &Path, upload_id: &str) -> Result<Vec<ChunkRef>, DbError> {
     let mut c = open_conn(path)?;
-    let tx = c.transaction()?;
+    let tx = imm_tx(&mut c)?;
     let chunks: Vec<ChunkRef> = {
         let mut stmt = tx.prepare("SELECT idx,message_id,file_id,size FROM mp_chunks WHERE upload_id=?")?;
         let mut rows = stmt.query([upload_id])?;
@@ -388,7 +396,7 @@ pub fn mp_abort(path: &Path, upload_id: &str) -> Result<Vec<ChunkRef>, DbError> 
 /// objects row; drops bookkeeping.
 pub fn mp_complete(path: &Path, upload_id: &str, mp: &MultipartUpload, part_numbers: &[i64], total_size: i64, etag: &str, now: i64) -> Result<(), DbError> {
     let mut c = open_conn(path)?;
-    let tx = c.transaction()?;
+    let tx = imm_tx(&mut c)?;
     tx.execute("INSERT OR IGNORE INTO buckets(name,created_at) VALUES(?,strftime('%s','now'))", [&mp.bucket])?;
     tx.execute("DELETE FROM object_chunks WHERE bucket=? AND key=?", params![mp.bucket, mp.key])?;
     let placeholders = std::iter::repeat("?").take(part_numbers.len()).collect::<Vec<_>>().join(",");
