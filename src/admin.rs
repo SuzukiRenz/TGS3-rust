@@ -1,4 +1,4 @@
-use crate::{config::Config, db};
+use crate::{config::Config, db, db::open_conn};
 use chrono::Utc;
 use rusqlite::Connection;
 use std::{path::{Path, PathBuf}, sync::Arc, time::Duration};
@@ -59,7 +59,7 @@ pub async fn backup_now_tagged(cfg: &Config, pre_restore: bool) -> Result<PathBu
 }
 
 fn sqlite_online_backup(src: &Path, dest: &Path) -> rusqlite::Result<()> {
-    let src_conn = Connection::open(src)?;
+    let src_conn = open_conn(src).map_err(|e| match e { db::DbError::Sql(sql_err) => sql_err })?;
     let mut dst_conn = Connection::open(dest)?;
     let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)?;
     backup.run_to_completion(5, Duration::from_millis(250), None)?;

@@ -33,6 +33,26 @@ fn retry_after_secs(status: u16, body: &serde_json::Value) -> Option<u64> {
 /// HTTP response leaks the credential.
 fn scrub(token: &str, s: String) -> String { if token.is_empty() { s } else { s.replace(token, "<token>") } }
 
+/// Extract (file_id, size) from a Telegram Message. Telegram may auto-convert
+/// sendDocument/sendMediaGroup payloads with a recognizable media type: a real
+/// MP4 becomes a ``video`` message, MP3 an ``audio``, GIF an ``animation`` --
+/// the ``document`` field is then absent and only parsing it yields an empty
+/// file_id, which bricks every later download (GET -> 500). Accept any media
+/// field that carries a file_id.
+fn extract_uploaded(msg: &serde_json::Value) -> Uploaded {
+    let message_id = msg.get("message_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    for field in ["document", "video", "audio", "animation", "video_note"] {
+        if let Some(doc) = msg.get(field) {
+            let file_id = doc.get("file_id").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
+            if !file_id.is_empty() {
+                let size = doc.get("file_size").and_then(|v| v.as_i64()).unwrap_or(0);
+                return Uploaded { file_id, message_id, size };
+            }
+        }
+    }
+    Uploaded { file_id: String::new(), message_id, size: 0 }
+}
+
 /// Upload a single chunk file as a Telegram document, retrying on transient network
 /// errors and on 429 rate limiting (honoring `retry_after`).
 pub async fn upload(client: &Client, token: &str, chat: &str, path: &Path, filename: &str, content_type: &str) -> Result<Uploaded, TgError> {
@@ -59,11 +79,7 @@ pub async fn upload(client: &Client, token: &str, chat: &str, path: &Path, filen
         };
         if data["ok"].as_bool() == Some(true) {
             let msg = data.get("result").cloned().unwrap_or_default();
-            let message_id = msg.get("message_id").and_then(|v| v.as_i64()).unwrap_or(0);
-            let doc = msg.get("document").cloned().unwrap_or_default();
-            let file_id = doc.get("file_id").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
-            let size = doc.get("file_size").and_then(|v| v.as_i64()).unwrap_or(0);
-            return Ok(Uploaded { file_id, message_id, size });
+            return Ok(extract_uploaded(&msg));
         }
         if let Some(wait) = retry_after_secs(status, &data) {
             if attempt < MAX_RETRIES { tokio::time::sleep(Duration::from_secs(wait)).await; continue; }
@@ -120,11 +136,7 @@ pub async fn upload_album(client: &Client, token: &str, chat: &str, items: &[Alb
             }
             let mut out = Vec::with_capacity(items.len());
             for msg in arr {
-                let message_id = msg.get("message_id").and_then(|v| v.as_i64()).unwrap_or(0);
-                let doc = msg.get("document").cloned().unwrap_or_default();
-                let file_id = doc.get("file_id").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
-                let size = doc.get("file_size").and_then(|v| v.as_i64()).unwrap_or(0);
-                out.push(Uploaded { file_id, message_id, size });
+                out.push(extract_uploaded(&msg));
             }
             return Ok(out);
         }

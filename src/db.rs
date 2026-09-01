@@ -1,9 +1,21 @@
 use rusqlite::{params, Connection};
 use std::path::Path;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum DbError { #[error(transparent)] Sql(#[from] rusqlite::Error) }
+
+/// Open a connection with WAL + busy_timeout so concurrent writers queue
+/// instead of failing instantly with "database is locked" (SQLite's default
+/// busy timeout is 0 -- any overlap between two write transactions errors out).
+/// Every helper in this module opens a fresh short-lived connection, so the
+/// timeout is what makes concurrent multipart uploads / backups safe.
+pub fn open_conn(path: &Path) -> Result<Connection, DbError> {
+    let c = Connection::open(path)?;
+    c.busy_timeout(Duration::from_secs(10))?;
+    Ok(c)
+}
 
 #[derive(Clone, Debug)]
 pub struct ObjectMeta {
@@ -26,7 +38,7 @@ pub struct MultipartUpload {
 pub struct MultipartPart { pub part_number: i64, pub etag: String, pub size: i64, pub first_chunk_idx: i64, pub chunk_count: i64 }
 
 pub fn init(path: &Path) -> Result<(), DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     c.pragma_update(None, "journal_mode", "WAL")?;
     c.execute_batch("
         CREATE TABLE IF NOT EXISTS buckets(name TEXT PRIMARY KEY, created_at INTEGER NOT NULL);
@@ -99,18 +111,18 @@ fn row_to_part(r: &rusqlite::Row) -> rusqlite::Result<MultipartPart> {
 
 // ---------- credentials ----------
 pub fn cred_count(path: &Path) -> Result<i64, DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     let n: i64 = c.query_row("SELECT COUNT(*) FROM credentials", [], |r| r.get(0))?;
     Ok(n)
 }
 pub fn cred_insert(path: &Path, access_key: &str, secret_key: &str, is_root: bool, bucket: Option<&str>, prefix: &str) -> Result<(), DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     c.execute("INSERT INTO credentials(access_key,secret_key,is_root,bucket,prefix,created_at) VALUES(?,?,?,?,?,strftime('%s','now'))",
         params![access_key, secret_key, is_root as i64, bucket, prefix])?;
     Ok(())
 }
 pub fn cred_get(path: &Path, access_key: &str) -> Result<Option<Credential>, DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     let mut stmt = c.prepare("SELECT access_key,secret_key,is_root,bucket,prefix FROM credentials WHERE access_key=?")?;
     let mut rows = stmt.query([access_key])?;
     match rows.next()? { Some(r) => Ok(Some(row_to_cred(r)?)), None => Ok(None) }
@@ -120,7 +132,7 @@ pub fn cred_get(path: &Path, access_key: &str) -> Result<Option<Credential>, DbE
 /// Works for root and scoped keys alike; safe while the server is running (each
 /// request re-reads the row, so the next request uses the new secret immediately).
 pub fn cred_rotate(path: &Path, access_key: &str, new_secret: &str) -> Result<bool, DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     let n = c.execute("UPDATE credentials SET secret_key=? WHERE access_key=?", params![new_secret, access_key])?;
     Ok(n > 0)
 }
@@ -128,7 +140,7 @@ pub fn cred_rotate(path: &Path, access_key: &str, new_secret: &str) -> Result<bo
 /// Atomically rekey a credential: new secret AND new access_key in one transaction.
 /// The old access_key disappears immediately -- clients still holding it get 403.
 pub fn cred_rekey(path: &Path, old_access_key: &str, new_access_key: &str, new_secret: &str) -> Result<bool, DbError> {
-    let mut c = Connection::open(path)?;
+    let mut c = open_conn(path)?;
     let tx = c.transaction()?;
     let n = tx.execute(
         "UPDATE credentials SET access_key=?, secret_key=? WHERE access_key=?",
@@ -138,7 +150,7 @@ pub fn cred_rekey(path: &Path, old_access_key: &str, new_access_key: &str, new_s
     Ok(n > 0)
 }
 pub fn cred_list(path: &Path) -> Result<Vec<Credential>, DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     let mut stmt = c.prepare("SELECT access_key,secret_key,is_root,bucket,prefix FROM credentials ORDER BY is_root DESC, access_key")?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
@@ -146,13 +158,13 @@ pub fn cred_list(path: &Path) -> Result<Vec<Credential>, DbError> {
     Ok(out)
 }
 pub fn cred_remove(path: &Path, access_key: &str) -> Result<bool, DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     Ok(c.execute("DELETE FROM credentials WHERE access_key=? AND is_root=0", [access_key])? > 0)
 }
 
 // ---------- buckets ----------
 pub fn list_buckets(path: &Path) -> Result<Vec<String>, DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     let mut stmt = c.prepare("SELECT name FROM buckets ORDER BY name")?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
@@ -160,18 +172,18 @@ pub fn list_buckets(path: &Path) -> Result<Vec<String>, DbError> {
     Ok(out)
 }
 pub fn bucket_exists(path: &Path, bucket: &str) -> Result<bool, DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     Ok(c.query_row("SELECT 1 FROM buckets WHERE name=?", [bucket], |_| Ok(true)).unwrap_or(false))
 }
 pub fn ensure_bucket(path: &Path, bucket: &str) -> Result<(), DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     c.execute("INSERT OR IGNORE INTO buckets(name,created_at) VALUES(?,strftime('%s','now'))", [bucket])?;
     Ok(())
 }
 
 // ---------- objects (chunked) ----------
 pub fn put_object(path: &Path, o: &ObjectMeta, chunks: &[ChunkRef]) -> Result<(), DbError> {
-    let mut c = Connection::open(path)?;
+    let mut c = open_conn(path)?;
     let tx = c.transaction()?;
     tx.execute("INSERT OR IGNORE INTO buckets(name,created_at) VALUES(?,strftime('%s','now'))", [&o.bucket])?;
     tx.execute("DELETE FROM object_chunks WHERE bucket=? AND key=?", params![o.bucket, o.key])?;
@@ -184,13 +196,13 @@ pub fn put_object(path: &Path, o: &ObjectMeta, chunks: &[ChunkRef]) -> Result<()
     Ok(())
 }
 pub fn get_object(path: &Path, bucket: &str, key: &str) -> Result<Option<ObjectMeta>, DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     let mut stmt = c.prepare("SELECT bucket,key,size,content_type,etag,updated_at,sse_algorithm,sse_customer_key_md5 FROM objects WHERE bucket=? AND key=?")?;
     let mut rows = stmt.query(params![bucket, key])?;
     match rows.next()? { Some(r) => Ok(Some(row_to_object(r)?)), None => Ok(None) }
 }
 pub fn get_chunks(path: &Path, bucket: &str, key: &str) -> Result<Vec<ChunkRef>, DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     let mut stmt = c.prepare("SELECT idx,message_id,file_id,size FROM object_chunks WHERE bucket=? AND key=? ORDER BY idx")?;
     let mut rows = stmt.query(params![bucket, key])?;
     let mut out = Vec::new();
@@ -198,7 +210,7 @@ pub fn get_chunks(path: &Path, bucket: &str, key: &str) -> Result<Vec<ChunkRef>,
     Ok(out)
 }
 pub fn list_objects(path: &Path, bucket: &str, prefix: &str) -> Result<Vec<ObjectMeta>, DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     let mut stmt = c.prepare("SELECT bucket,key,size,content_type,etag,updated_at,sse_algorithm,sse_customer_key_md5 FROM objects WHERE bucket=? AND key LIKE ? ESCAPE '\\' ORDER BY key")?;
     let pat = format!("{}%", escape_like(prefix));
     let mut rows = stmt.query(params![bucket, pat])?;
@@ -212,7 +224,7 @@ fn escape_like(s: &str) -> String { s.replace('\\', "\\\\").replace('%', "\\%").
 /// for each message_id before actually deleting the Telegram message (CopyObject's fast path
 /// can leave multiple keys pointing at the same underlying message).
 pub fn delete_object(path: &Path, bucket: &str, key: &str) -> Result<Option<Vec<ChunkRef>>, DbError> {
-    let mut c = Connection::open(path)?;
+    let mut c = open_conn(path)?;
     let tx = c.transaction()?;
     let chunks: Vec<ChunkRef> = {
         let mut stmt = tx.prepare("SELECT idx,message_id,file_id,size FROM object_chunks WHERE bucket=? AND key=?")?;
@@ -227,7 +239,7 @@ pub fn delete_object(path: &Path, bucket: &str, key: &str) -> Result<Option<Vec<
     Ok(if existed { Some(chunks) } else { None })
 }
 pub fn chunk_still_referenced(path: &Path, message_id: i64, excluding_bucket: &str, excluding_key: &str) -> Result<bool, DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     Ok(c.query_row("SELECT 1 FROM object_chunks WHERE message_id=? AND NOT(bucket=? AND key=?) LIMIT 1", params![message_id, excluding_bucket, excluding_key], |_| Ok(true)).unwrap_or(false))
 }
 
@@ -237,7 +249,7 @@ pub fn chunk_still_referenced(path: &Path, message_id: i64, excluding_bucket: &s
 /// pass, handled separately in the HTTP layer). SSE-S3 objects copy fine since every
 /// object shares the same server-side master key.
 pub fn copy_object_fastpath(path: &Path, src_bucket: &str, src_key: &str, dst_bucket: &str, dst_key: &str, new_content_type: Option<&str>, now: i64) -> Result<Option<ObjectMeta>, DbError> {
-    let mut c = Connection::open(path)?;
+    let mut c = open_conn(path)?;
     let tx = c.transaction()?;
     let src: Option<ObjectMeta> = {
         let mut stmt = tx.prepare("SELECT bucket,key,size,content_type,etag,updated_at,sse_algorithm,sse_customer_key_md5 FROM objects WHERE bucket=? AND key=?")?;
@@ -261,13 +273,13 @@ pub fn copy_object_fastpath(path: &Path, src_bucket: &str, src_key: &str, dst_bu
 
 // ---------- multipart ----------
 pub fn mp_create(path: &Path, upload_id: &str, bucket: &str, key: &str, content_type: &str, sse_algorithm: Option<&str>, sse_customer_key_md5: Option<&str>) -> Result<(), DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     c.execute("INSERT INTO multipart_uploads(upload_id,bucket,key,content_type,sse_algorithm,sse_customer_key_md5,next_chunk_idx,bytes_so_far,parts_uploaded,created_at) VALUES(?,?,?,?,?,?,0,0,0,strftime('%s','now'))",
         params![upload_id, bucket, key, content_type, sse_algorithm, sse_customer_key_md5])?;
     Ok(())
 }
 pub fn mp_get(path: &Path, upload_id: &str) -> Result<Option<MultipartUpload>, DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     let mut stmt = c.prepare("SELECT upload_id,bucket,key,content_type,sse_algorithm,sse_customer_key_md5,next_chunk_idx,bytes_so_far,parts_uploaded FROM multipart_uploads WHERE upload_id=?")?;
     let mut rows = stmt.query([upload_id])?;
     match rows.next()? { Some(r) => Ok(Some(row_to_mp(r)?)), None => Ok(None) }
@@ -276,7 +288,7 @@ pub fn mp_get(path: &Path, upload_id: &str) -> Result<Option<MultipartUpload>, D
 /// disjoint per part -- ordering between parts no longer matters now that each chunk
 /// carries its own GCM nonce, but chunk indices must still not collide).
 pub fn mp_reserve(path: &Path, upload_id: &str, n_chunks: i64) -> Result<i64, DbError> {
-    let mut c = Connection::open(path)?;
+    let mut c = open_conn(path)?;
     let tx = c.transaction()?;
     let first: i64 = tx.query_row("SELECT next_chunk_idx FROM multipart_uploads WHERE upload_id=?", [upload_id], |r| r.get(0))?;
     tx.execute("UPDATE multipart_uploads SET next_chunk_idx=next_chunk_idx+? WHERE upload_id=?", params![n_chunks, upload_id])?;
@@ -284,7 +296,7 @@ pub fn mp_reserve(path: &Path, upload_id: &str, n_chunks: i64) -> Result<i64, Db
     Ok(first)
 }
 pub fn mp_insert_chunk(path: &Path, upload_id: &str, idx: i64, part_number: i64, message_id: i64, file_id: &str, size: i64) -> Result<(), DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     c.execute("INSERT INTO mp_chunks(upload_id,idx,part_number,message_id,file_id,size) VALUES(?,?,?,?,?,?)", params![upload_id, idx, part_number, message_id, file_id, size])?;
     Ok(())
 }
@@ -294,7 +306,7 @@ pub fn mp_insert_chunk(path: &Path, upload_id: &str, idx: i64, part_number: i64,
 /// multipart_parts bookkeeping row in one transaction, replacing the old
 /// mp_insert_chunk-per-chunk + mp_advance two-step.
 pub fn mp_stage_part(path: &Path, upload_id: &str, part_number: i64, etag: &str, part_size: i64, rows: &[ChunkRef], staged_paths: &[String]) -> Result<(), DbError> {
-    let mut c = Connection::open(path)?;
+    let mut c = open_conn(path)?;
     let tx = c.transaction()?;
     for (r, p) in rows.iter().zip(staged_paths.iter()) {
         tx.execute("INSERT INTO mp_chunks(upload_id,idx,part_number,message_id,file_id,size) VALUES(?,?,?,?,?,?)",
@@ -312,7 +324,7 @@ pub fn mp_stage_part(path: &Path, upload_id: &str, part_number: i64, etag: &str,
 /// Album mode: swap in the real Telegram identities for completed chunks whose
 /// message_id is still 0 (staged on disk). `triples` is (idx, message_id, file_id).
 pub fn mp_fill_album_results(path: &Path, upload_id: &str, triples: &[(i64, i64, String)]) -> Result<(), DbError> {
-    let mut c = Connection::open(path)?;
+    let mut c = open_conn(path)?;
     let tx = c.transaction()?;
     for (idx, message_id, file_id) in triples {
         tx.execute("UPDATE mp_chunks SET message_id=?, file_id=? WHERE upload_id=? AND idx=? AND message_id=0",
@@ -326,7 +338,7 @@ pub fn mp_fill_album_results(path: &Path, upload_id: &str, triples: &[(i64, i64,
 /// already-pushed rows (message_id>0, real file_id) are included too so Complete can
 /// skip/keep them correctly -- the caller filters on part_number.
 pub fn mp_get_staged_chunks_pn(path: &Path, upload_id: &str) -> Result<Vec<(i64, i64, i64, String, i64)>, DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     let mut stmt = c.prepare("SELECT idx,message_id,size,file_id,part_number FROM mp_chunks WHERE upload_id=? ORDER BY idx")?;
     let mut rows = stmt.query([upload_id])?;
     let mut out = Vec::new();
@@ -336,7 +348,7 @@ pub fn mp_get_staged_chunks_pn(path: &Path, upload_id: &str) -> Result<Vec<(i64,
     Ok(out)
 }
 pub fn mp_advance(path: &Path, upload_id: &str, part_number: i64, etag: &str, part_size: i64, first_chunk_idx: i64, chunk_count: i64) -> Result<(), DbError> {
-    let mut c = Connection::open(path)?;
+    let mut c = open_conn(path)?;
     let tx = c.transaction()?;
     tx.execute("UPDATE multipart_uploads SET bytes_so_far=bytes_so_far+?, parts_uploaded=parts_uploaded+1 WHERE upload_id=?", params![part_size, upload_id])?;
     tx.execute("INSERT OR REPLACE INTO multipart_parts VALUES(?,?,?,?,?,?)", params![upload_id, part_number, etag, part_size, first_chunk_idx, chunk_count])?;
@@ -344,7 +356,7 @@ pub fn mp_advance(path: &Path, upload_id: &str, part_number: i64, etag: &str, pa
     Ok(())
 }
 pub fn mp_list_parts(path: &Path, upload_id: &str) -> Result<Vec<MultipartPart>, DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     let mut stmt = c.prepare("SELECT part_number,etag,size,first_chunk_idx,chunk_count FROM multipart_parts WHERE upload_id=? ORDER BY part_number")?;
     let mut rows = stmt.query([upload_id])?;
     let mut out = Vec::new();
@@ -353,7 +365,7 @@ pub fn mp_list_parts(path: &Path, upload_id: &str) -> Result<Vec<MultipartPart>,
 }
 /// Abort: return every staged Telegram chunk (caller deletes them from Telegram) and drop bookkeeping.
 pub fn mp_abort(path: &Path, upload_id: &str) -> Result<Vec<ChunkRef>, DbError> {
-    let mut c = Connection::open(path)?;
+    let mut c = open_conn(path)?;
     let tx = c.transaction()?;
     let chunks: Vec<ChunkRef> = {
         let mut stmt = tx.prepare("SELECT idx,message_id,file_id,size FROM mp_chunks WHERE upload_id=?")?;
@@ -375,7 +387,7 @@ pub fn mp_abort(path: &Path, upload_id: &str) -> Result<Vec<ChunkRef>, DbError> 
 /// uploaded concurrently or out of order. Renumbers sequentially; inserts the final
 /// objects row; drops bookkeeping.
 pub fn mp_complete(path: &Path, upload_id: &str, mp: &MultipartUpload, part_numbers: &[i64], total_size: i64, etag: &str, now: i64) -> Result<(), DbError> {
-    let mut c = Connection::open(path)?;
+    let mut c = open_conn(path)?;
     let tx = c.transaction()?;
     tx.execute("INSERT OR IGNORE INTO buckets(name,created_at) VALUES(?,strftime('%s','now'))", [&mp.bucket])?;
     tx.execute("DELETE FROM object_chunks WHERE bucket=? AND key=?", params![mp.bucket, mp.key])?;
@@ -399,7 +411,7 @@ pub fn mp_complete(path: &Path, upload_id: &str, mp: &MultipartUpload, part_numb
     Ok(())
 }
 pub fn mp_list_uploads(path: &Path, bucket: &str) -> Result<Vec<MultipartUpload>, DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     let mut stmt = c.prepare("SELECT upload_id,bucket,key,content_type,sse_algorithm,sse_customer_key_md5,next_chunk_idx,bytes_so_far,parts_uploaded FROM multipart_uploads WHERE bucket=? ORDER BY created_at")?;
     let mut rows = stmt.query([bucket])?;
     let mut out = Vec::new();
@@ -411,18 +423,18 @@ pub fn mp_list_uploads(path: &Path, bucket: &str) -> Result<Vec<MultipartUpload>
 
 /// Read one setting; `None` = not overridden (callers fall back to env default).
 pub fn setting_get(path: &Path, key: &str) -> Result<Option<String>, DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     Ok(c.query_row("SELECT value FROM settings WHERE key=?", [key], |r| r.get::<_, String>(0)).ok())
 }
 /// Insert-or-update one setting. Validated by the caller before reaching here.
 pub fn setting_set(path: &Path, key: &str, value: &str) -> Result<(), DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [key, value])?;
     Ok(())
 }
 /// All overridden settings as (key, value) pairs, for /status display.
 pub fn settings_list(path: &Path) -> Result<Vec<(String, String)>, DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     let mut stmt = c.prepare("SELECT key,value FROM settings ORDER BY key")?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
@@ -434,7 +446,7 @@ pub fn settings_list(path: &Path) -> Result<Vec<(String, String)>, DbError> {
 
 pub struct Stats { pub objects: i64, pub bytes: i64, pub buckets: i64, pub keys: i64, pub mp_active: i64, pub chunks: i64 }
 pub fn stats(path: &Path) -> Result<Stats, DbError> {
-    let c = Connection::open(path)?;
+    let c = open_conn(path)?;
     let one = |sql: &str| -> Result<i64, DbError> { Ok(c.query_row(sql, [], |r| r.get(0))?) };
     Ok(Stats {
         objects: one("SELECT COUNT(*) FROM objects")?,
