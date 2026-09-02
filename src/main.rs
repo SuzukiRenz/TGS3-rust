@@ -202,6 +202,14 @@ async fn do_delete(a: &App, bucket: &str, key: &str) -> Result<(), String> {
     let (b2, k2) = (bucket.to_owned(), key.to_owned());
     let removed = match db_call(move || db::delete_object(&p, &b2, &k2)).await { Ok(v) => v, Err(_) => return Err("InternalError".into()) };
     let Some(chunks) = removed else { return Err("NoSuchKey".into()) };
+    delete_chunks_messages(a, bucket, key, chunks).await;
+    Ok(())
+}
+
+/// Delete the Telegram messages backing `chunks` unless another (bucket,key) still
+/// references the same message (CopyObject's fast path can share messages). Used by
+/// the DELETE path and by PUT-overwrite so replaced objects don't leak channel storage.
+async fn delete_chunks_messages(a: &App, bucket: &str, key: &str, chunks: Vec<db::ChunkRef>) {
     let mut to_delete = Vec::new();
     for ch in &chunks {
         let p2 = a.cfg.database_path.clone();
@@ -210,7 +218,6 @@ async fn do_delete(a: &App, bucket: &str, key: &str) -> Result<(), String> {
         if !still_ref { to_delete.push(ch.message_id); }
     }
     if !to_delete.is_empty() { telegram::delete_messages(&a.client, &a.cfg.bot_token, &a.cfg.chat_id, to_delete).await; }
-    Ok(())
 }
 
 // ---------------- object-level ----------------
@@ -239,7 +246,8 @@ async fn put(State(a): State<App>, h: HeaderMap, uri: Uri, Path((bucket, key)): 
         Err(e) => { storage::cleanup(&staged).await; return e; }
     };
     if let Err(e) = scope_bucket(&cred, &bucket) { storage::cleanup(&staged).await; return e; }
-    let real_key = match scope_key(&cred, &bucket, &key) { Ok(k) => k, Err(e) => { storage::cleanup(&staged).await; return e; } };
+    let (real_key, real_key2) = match scope_key(&cred, &bucket, &key) { Ok(k) => (k.clone(), k), Err(e) => { storage::cleanup(&staged).await; return e; } };
+    let real_key_for_meta = real_key.clone();
     let ct = h.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("application/octet-stream").to_owned();
     let filename = key.rsplit('/').next().unwrap_or(&key).to_owned();
     let chunks = match storage::upload(&a.client, &a.cfg, &staged.chunks, 0, &filename, &ct, true).await {
@@ -252,11 +260,21 @@ async fn put(State(a): State<App>, h: HeaderMap, uri: Uri, Path((bucket, key)): 
         crypto::SseRequest::S3 => (Some("AES256".to_owned()), None),
         crypto::SseRequest::Customer { key_md5, .. } => (Some("AES256".to_owned()), Some(key_md5.clone())),
     };
-    let o = db::ObjectMeta { bucket: bucket.clone(), key: real_key, size: staged.total_size, content_type: ct, etag: etag.clone(), updated_at: Utc::now().timestamp(), sse_algorithm: sse_alg.clone(), sse_customer_key_md5: sse_md5 };
+    let o = db::ObjectMeta { bucket: bucket.clone(), key: real_key_for_meta, size: staged.total_size, content_type: ct, etag: etag.clone(), updated_at: Utc::now().timestamp(), sse_algorithm: sse_alg.clone(), sse_customer_key_md5: sse_md5 };
     let p = a.cfg.database_path.clone();
     let chunks_for_rollback = chunks.clone();
+    // Capture the OLD chunk list before put_object replaces the rows, so the replaced
+    // object's Telegram messages can be purged after a successful overwrite.
+    let old_chunks = match db_call({ let p2 = a.cfg.database_path.clone(); let b2 = bucket.clone(); let k2 = real_key.clone(); move || db::get_chunks(&p2, &b2, &k2) }).await {
+        Ok(c) => c,
+        Err(_) => Vec::new(), // best-effort: overwrite still proceeds without the purge
+    };
+    let was_overwrite = !old_chunks.is_empty();
     match db_call(move || db::put_object(&p, &o, &chunks)).await {
         Ok(_) => {
+            if was_overwrite {
+                delete_chunks_messages(&a, &bucket, &real_key2, old_chunks).await;
+            }
             let mut hdrs = vec![(axum::http::header::ETAG, format!("\"{etag}\""))];
             if let Some(alg) = &sse_alg { hdrs.push((HeaderName::from_static("x-amz-server-side-encryption"), alg.clone())); }
             resp_with_headers(StatusCode::OK, hdrs)
