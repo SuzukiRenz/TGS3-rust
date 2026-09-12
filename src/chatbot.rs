@@ -293,7 +293,17 @@ async fn status(cfg: &std::sync::Arc<crate::Config>) -> String {
 async fn send(client: &reqwest::Client, token: &str, chat_id: i64, text: &str) {
     if text.is_empty() { return; }
     // 4096 chars is Telegram's hard per-message limit; truncate defensively.
-    let text = if text.len() > 4000 { format!("{}…", &text[..4000]) } else { text.to_owned() };
+    // Truncate by char count, not byte offset -- these replies are Chinese (UTF-8
+    // multi-byte), so a raw byte slice can land mid-character and panic. Telegram's
+    // limit is 4096 UTF-16 code units; capping at 3800 chars stays comfortably under
+    // that for any mix of BMP/astral characters.
+    let text = if text.chars().count() > 3800 {
+        let mut t: String = text.chars().take(3800).collect();
+        t.push('…');
+        t
+    } else {
+        text.to_owned()
+    };
     let url = format!("{API_BASE}/bot{token}/sendMessage");
     let body = serde_json::json!({ "chat_id": chat_id, "text": text });
     if let Err(e) = client.post(&url).json(&body).send().await {

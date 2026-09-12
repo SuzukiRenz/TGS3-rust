@@ -246,6 +246,23 @@ pub fn delete_object(path: &Path, bucket: &str, key: &str) -> Result<Option<Vec<
     tx.commit()?;
     Ok(if existed { Some(chunks) } else { None })
 }
+/// Replace an object's physical chunk list in one transaction (used by the
+/// `consolidate` command to swap many small chunks for fewer, uniformly-sized
+/// ones). Only object_chunks changes -- size/etag/content_type/sse fields on the
+/// `objects` row are untouched since the logical content is identical, just its
+/// physical layout. Caller uploads the new chunks to Telegram and deletes the old
+/// ones itself; this only flips which rows `objects`/GET see.
+pub fn swap_object_chunks(path: &Path, bucket: &str, key: &str, new_chunks: &[ChunkRef]) -> Result<(), DbError> {
+    let mut c = open_conn(path)?;
+    let tx = imm_tx(&mut c)?;
+    tx.execute("DELETE FROM object_chunks WHERE bucket=? AND key=?", params![bucket, key])?;
+    for ch in new_chunks {
+        tx.execute("INSERT INTO object_chunks VALUES(?,?,?,?,?,?)", params![bucket, key, ch.idx, ch.message_id, ch.file_id, ch.size])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn chunk_still_referenced(path: &Path, message_id: i64, excluding_bucket: &str, excluding_key: &str) -> Result<bool, DbError> {
     let c = open_conn(path)?;
     Ok(c.query_row("SELECT 1 FROM object_chunks WHERE message_id=? AND NOT(bucket=? AND key=?) LIMIT 1", params![message_id, excluding_bucket, excluding_key], |_| Ok(true)).unwrap_or(false))
@@ -450,7 +467,42 @@ pub fn settings_list(path: &Path) -> Result<Vec<(String, String)>, DbError> {
     Ok(out)
 }
 
-// ---------- quick stats for /status ----------
+// ---------- fsck ----------
+
+/// One physical chunk with enough context to report a problem usefully.
+pub struct ChunkRefFull { pub bucket: String, pub key: String, pub idx: i64, pub file_id: String }
+
+/// Every object_chunks row, for a DB -> Telegram consistency scan (does the stored
+/// file_id still resolve?). There's no feasible reverse direction (Telegram -> DB)
+/// over the Bot API: bots have no "list all messages in this channel" call.
+pub fn list_all_chunks(path: &Path) -> Result<Vec<ChunkRefFull>, DbError> {
+    let c = open_conn(path)?;
+    let mut stmt = c.prepare("SELECT bucket,key,idx,file_id FROM object_chunks ORDER BY bucket,key,idx")?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        out.push(ChunkRefFull { bucket: r.get(0)?, key: r.get(1)?, idx: r.get(2)?, file_id: r.get(3)? });
+    }
+    Ok(out)
+}
+
+/// Multipart uploads created before `before_ts` and still open -- almost always a
+/// client that crashed or gave up mid-transfer, leaving staged chunks in Telegram
+/// that will never be referenced by a completed object. Caveat: this is *creation*
+/// time, not last-activity time (the schema doesn't track the latter), so a
+/// legitimately slow multi-hour upload could show up too -- the default 24h
+/// threshold is meant to comfortably clear that case; raise --stale-hours if you
+/// routinely do very large/slow uploads.
+pub fn list_stale_multipart_uploads(path: &Path, before_ts: i64) -> Result<Vec<MultipartUpload>, DbError> {
+    let c = open_conn(path)?;
+    let mut stmt = c.prepare("SELECT upload_id,bucket,key,content_type,sse_algorithm,sse_customer_key_md5,next_chunk_idx,bytes_so_far,parts_uploaded FROM multipart_uploads WHERE created_at < ? ORDER BY created_at")?;
+    let mut rows = stmt.query([before_ts])?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? { out.push(row_to_mp(r)?); }
+    Ok(out)
+}
+
+
 
 pub struct Stats { pub objects: i64, pub bytes: i64, pub buckets: i64, pub keys: i64, pub mp_active: i64, pub chunks: i64 }
 pub fn stats(path: &Path) -> Result<Stats, DbError> {

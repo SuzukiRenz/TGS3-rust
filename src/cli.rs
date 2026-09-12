@@ -27,6 +27,26 @@ pub enum Cmd {
         /// Path to a .sqlite file, e.g. a downloaded admin/backup/ snapshot.
         file: String,
     },
+    /// Consistency scan: verify every stored chunk's Telegram message/file is still
+    /// retrievable, and report multipart uploads abandoned mid-transfer. Read-only
+    /// unless --abort-stale is given. Calls Telegram's getFile once per chunk, paced
+    /// the same as normal downloads -- can take a while on a large store.
+    Fsck {
+        /// Multipart uploads with no activity older than this are reported as stale.
+        #[arg(long, default_value_t = 24)]
+        stale_hours: i64,
+        /// Also abort (delete) the stale uploads found, freeing their Telegram chunks.
+        #[arg(long)]
+        abort_stale: bool,
+    },
+    /// On-demand only: re-chunk a multipart-assembled object into fewer, uniform
+    /// CHUNK_SIZE_BYTES pieces (downloads + re-uploads it once). Never runs
+    /// automatically -- multipart objects otherwise keep whatever part size the S3
+    /// client chose to use.
+    Consolidate {
+        bucket: String,
+        key: String,
+    },
 }
 
 #[derive(Subcommand)]

@@ -1,4 +1,4 @@
-mod admin; mod auth; mod chatbot; mod cli; mod config; mod crypto; mod db; mod multipart; mod storage; mod telegram; mod util;
+mod admin; mod auth; mod chatbot; mod cli; mod config; mod consolidate; mod crypto; mod db; mod multipart; mod storage; mod telegram; mod util;
 
 /// Format a unix timestamp (seconds) as an RFC 7231 IMF-fixdate string for the
 /// Last-Modified header. OpenList/AWS SDK clients dereference LastModified on
@@ -678,6 +678,59 @@ pub(crate) async fn sync_root_credentials_file(c: &Config, old_access_key: &str,
     info!(path = ?path, "ROOT_CREDENTIALS.txt updated to match rotated root key");
 }
 
+/// Read-only by default: verify every chunk's file_id still resolves via Telegram's
+/// getFile, and list multipart uploads abandoned mid-transfer. Paced the same as
+/// normal chunk downloads (DOWNLOAD_PERMITS + the 15/s getFile gate), so this won't
+/// trip Telegram's rate limits even on a large store -- it can just take a while.
+async fn run_fsck(c: &Config, stale_hours: i64, abort_stale: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let client = reqwest::Client::builder().build()?;
+    let p = c.database_path.clone();
+    let chunks = tokio::task::spawn_blocking(move || db::list_all_chunks(&p)).await??;
+    println!("scanning {} chunk(s)...", chunks.len());
+    let mut broken = Vec::new();
+    for (i, ch) in chunks.iter().enumerate() {
+        let permit = telegram::DOWNLOAD_PERMITS.acquire().await;
+        let ok = telegram::file_url(&client, &c.bot_token, &ch.file_id).await.is_ok();
+        drop(permit);
+        if !ok { broken.push(format!("{}/{} chunk #{} (file_id {})", ch.bucket, ch.key, ch.idx, ch.file_id)); }
+        if (i + 1) % 50 == 0 { println!("  ...{}/{}", i + 1, chunks.len()); }
+    }
+    if broken.is_empty() {
+        println!("✅ all {} chunk(s) resolve on Telegram", chunks.len());
+    } else {
+        println!("❌ {} chunk(s) failed to resolve -- affected objects are broken (GET/HEAD will error):", broken.len());
+        for b in &broken { println!("  {b}"); }
+        println!("no automatic fix here: re-upload the affected object(s), there is no way to recover a deleted Telegram message");
+    }
+
+    let before = Utc::now().timestamp() - stale_hours * 3600;
+    let p = c.database_path.clone();
+    let stale = tokio::task::spawn_blocking(move || db::list_stale_multipart_uploads(&p, before)).await??;
+    if stale.is_empty() {
+        println!("✅ no multipart uploads older than {stale_hours}h");
+    } else {
+        println!("⚠️ {} multipart upload(s) older than {stale_hours}h (likely abandoned):", stale.len());
+        for u in &stale { println!("  {} -> {}/{} ({} part(s), {} bytes staged)", u.upload_id, u.bucket, u.key, u.parts_uploaded, u.bytes_so_far); }
+        if abort_stale {
+            for u in &stale {
+                let p2 = c.database_path.clone();
+                let uid = u.upload_id.clone();
+                match tokio::task::spawn_blocking(move || db::mp_abort(&p2, &uid)).await? {
+                    Ok(chunks) => {
+                        let ids: Vec<i64> = chunks.into_iter().map(|c| c.message_id).collect();
+                        if !ids.is_empty() { telegram::delete_messages(&client, &c.bot_token, &c.chat_id, ids).await; }
+                        println!("  aborted {}", u.upload_id);
+                    }
+                    Err(e) => println!("  failed to abort {}: {e}", u.upload_id),
+                }
+            }
+        } else {
+            println!("re-run with --abort-stale to delete these and free their staged Telegram chunks");
+        }
+    }
+    Ok(())
+}
+
 async fn show_root_key(c: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let p = c.database_path.clone();
     let creds = tokio::task::spawn_blocking(move || db::cred_list(&p)).await??;
@@ -712,6 +765,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             admin::recover_from(&c, &PathBuf::from(file)).await.map_err(std::io::Error::other)?;
             println!("restored");
             return Ok(());
+        }
+        Some(cli::Cmd::Fsck { stale_hours, abort_stale }) => return run_fsck(&c, stale_hours, abort_stale).await,
+        Some(cli::Cmd::Consolidate { bucket, key }) => {
+            let client = reqwest::Client::builder().build()?;
+            match consolidate::consolidate_object(&client, &c, &bucket, &key).await {
+                Ok(msg) => { println!("{msg}"); return Ok(()); }
+                Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+            }
         }
         Some(cli::Cmd::Serve) | None => {}
     }

@@ -157,25 +157,39 @@ pub async fn file_url(client: &Client, token: &str, file_id: &str) -> Result<Str
 
 // --- concurrent download path -----------------------------------------------
 
+fn initial_concurrency() -> usize {
+    std::env::var("CONCURRENCY").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| (1..=32).contains(&n)).unwrap_or(6)
+}
+
 /// Bounded in-flight chunk downloads. Initialized from CONCURRENCY (default 6).
 /// Caps simultaneous getFile+connect operations per *and across* GET requests,
 /// keeping memory and 429 pressure bounded on small VPSes.
 pub static DOWNLOAD_PERMITS: once_cell::sync::Lazy<tokio::sync::Semaphore> =
-    once_cell::sync::Lazy::new(|| tokio::sync::Semaphore::new(
-        std::env::var("CONCURRENCY").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n >= 1 && n <= 32).unwrap_or(6),
-    ));
+    once_cell::sync::Lazy::new(|| tokio::sync::Semaphore::new(initial_concurrency()));
+
+/// True configured concurrency limit, tracked independently of the semaphore's
+/// `available_permits()` -- that count reflects only currently-*unused* permits,
+/// which is wrong to diff against once any downloads are in flight (checked-out
+/// permits aren't visible to it). This is the single source of truth for "what did
+/// the operator ask for"; the semaphore's capacity is kept in sync with it. Shares
+/// the same env-derived starting value as DOWNLOAD_PERMITS -- initializing this to a
+/// hardcoded default instead would desync the two the moment CONCURRENCY differs
+/// from that default.
+static DOWNLOAD_LIMIT: once_cell::sync::Lazy<std::sync::atomic::AtomicUsize> =
+    once_cell::sync::Lazy::new(|| std::sync::atomic::AtomicUsize::new(initial_concurrency()));
 
 /// Hot-resize the download semaphore from the chat bot's /set concurrency command.
-/// Growing adds permits immediately; shrinking closes permits that will free up as
-/// in-flight downloads finish (acquired permits are never force-revoked). Returns
-/// the effective current limit.
+/// Growing adds permits immediately; shrinking forgets permits that will actually
+/// free up as in-flight downloads finish (acquired permits are never force-revoked,
+/// so the limit takes full effect once current transfers complete). Returns the
+/// effective new limit.
 pub fn set_download_permits(n: usize) -> usize {
     let n = n.clamp(1, 32);
+    let old = DOWNLOAD_LIMIT.swap(n, std::sync::atomic::Ordering::SeqCst);
     let sem = &*DOWNLOAD_PERMITS;
-    let cur = sem.available_permits();
-    if n > cur { sem.add_permits(n - cur); }
-    else if n < cur { sem.forget_permits(cur - n); }
-    sem.available_permits().max(0).max(1) // never report below 1; clamp safety
+    if n > old { sem.add_permits(n - old); }
+    else if n < old { sem.forget_permits(old - n); }
+    n
 }
 
 /// Global pacing gate for getFile calls across all in-flight downloads.
@@ -192,7 +206,7 @@ static GET_FILE_GATE: once_cell::sync::Lazy<tokio::sync::Mutex<tokio::time::Inte
 
 /// Pace getFile calls through the global gate (15/s), retrying on 429 with the
 /// server-provided `retry_after` and on transient network errors.
-async fn file_url_limited(client: &Client, token: &str, file_id: &str) -> Result<String, TgError> {
+pub(crate) async fn file_url_limited(client: &Client, token: &str, file_id: &str) -> Result<String, TgError> {
     let url = format!("{API_BASE}/bot{token}/getFile");
     let mut attempt = 0u32;
     loop {
